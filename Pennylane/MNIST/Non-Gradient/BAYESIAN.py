@@ -1,0 +1,103 @@
+from skopt import gp_minimize
+from skopt.space import Real
+import pennylane.numpy as pnp
+import os
+import sys
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+from tqdm import tqdm
+from helper.fetch_mnist import preprocess_image
+from helper.create_qnn_no_noise import create_qnn
+from helper.cross_entropy import cross_entropy_loss
+from Data.params import *
+import pandas as pd
+
+def train_qnn(x, y, n_qubits, n_layers, num_measurment_gates, num_epochs):
+    forward_pass = create_qnn(n_layers, n_qubits)
+    if n_qubits == 4:
+        params = two_four
+    elif n_qubits == 8:
+        params = three_eight
+    elif n_qubits == 10:
+        params = five_ten
+    else:
+        params = pnp.random.uniform(0, 2*pnp.pi, size=(n_layers, n_qubits, 2))
+        
+    original_shape = params.shape 
+    loss_history = []
+    fp_history = []
+    fp_count = 0
+    
+    n_params = params.size
+    dimensions = [Real(0, 2*pnp.pi, name=f'param_{i}') for i in range(n_params)]
+    
+    for epoch in tqdm(range(num_epochs), desc="Epochs"):
+        s = 100
+        #random_indices = pnp.random.choice(len(x), size=s, replace=False)
+        #x_batch = x[random_indices]
+        #y_batch = y[random_indices]
+        x_t = x[epoch*s:(epoch+1)*s]
+        y_t = y[epoch*s:(epoch+1)*s]
+        
+        params_flat = params.flatten()
+        
+        def epoch_cost_function(p):
+            nonlocal fp_count
+            p_array = pnp.array(p)
+            p_reshaped = p_array.reshape(original_shape)
+            total_loss = 0
+            for image, label in zip(x_t, y_t):
+                out = forward_pass(image, p_reshaped, num_measurment_gates)
+                loss = cross_entropy_loss(out, label)
+                total_loss += loss
+                fp_count += 1
+            
+            avg_loss = total_loss / len(x_t)
+            return float(avg_loss)
+        
+        result = gp_minimize(
+            epoch_cost_function,
+            dimensions,
+            x0=params_flat.tolist(),
+            n_calls=25,
+            acq_func='EI',
+            random_state=42,
+            n_initial_points=1
+        )
+
+        params_flat = pnp.array(result.x)
+        params = params_flat.reshape(original_shape)
+        
+        test_loss = 0
+        correct = 0
+        test_size = 100
+        test_indices = pnp.random.choice(len(x), size=test_size, replace=False)
+            
+        for i in test_indices:
+            out = forward_pass(x[i], params, num_measurment_gates)
+            test_loss += cross_entropy_loss(out, y[i])
+            if pnp.argmax(out) == y[i]:
+                correct += 1
+            
+        avg_loss = test_loss / test_size
+        accuracy = correct / test_size
+        loss_history.append(round(float(avg_loss), 4))
+        fp_history.append(fp_count)
+            
+        print(f"Epoch {epoch}, FP: {fp_count}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2%}")
+    
+    return params, fp_history, loss_history
+
+# --------------------------------- Model Setup ---------------------------
+df = pd.read_csv('../../data/four_digit.csv')
+x = df.drop('label', axis=1).values
+y = df['label'].values
+
+num_qubits = num_components = 4
+num_layers = 2
+num_measurment_gates = 2
+num_epochs = 20
+x = preprocess_image(x, num_components)
+
+optimized_params, fp_hist, loss_hist = train_qnn(x, y, num_qubits, num_layers, num_measurment_gates, num_epochs)
